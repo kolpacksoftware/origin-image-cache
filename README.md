@@ -1,58 +1,60 @@
 # origin-image-cache
 
-Serve image bytes for an origin URL. A client asks with the original image URL and receives the bytes from a configured local index, or the service fetches the URL and stores the miss.
-
-Install from PyPI, a local clone, or a Git URL (see below).
+A read-through cache for images, keyed by origin URL. A hit is served from a local index directory; a miss is fetched from the origin, checked to be PNG, JPEG, GIF, WebP, or SVG, and stored. Python 3.10+, no runtime dependencies.
 
 ## Install
 
-**From PyPI** (when published):
-
-```bash
-pip install origin-image-cache
-```
-
-**From a local clone** (development):
-
-```bash
-pip install -e "/path/to/origin-image-cache[dev]"
-```
-
-**From a Git URL**:
-
 ```bash
 pip install "origin-image-cache @ git+https://github.com/kolpacksoftware/origin-image-cache.git@main"
-# or
-pip install "origin-image-cache @ git+ssh://git@github.com/kolpacksoftware/origin-image-cache.git@main"
 ```
 
-You can pin a branch (`@main`), tag (`@v0.1.0`), or commit (`@abc1234`).
+Pin with `@v0.1.0` or a commit SHA. `pip install origin-image-cache` will work once it is on PyPI.
 
-## CLI
+## Server
 
 ```bash
-origin-image-cache --version
-
-origin-image-cache serve --index ./index --host 127.0.0.1 --port 8765
-
-curl -fsS "http://127.0.0.1:8765/v1/image?url=https%3A%2F%2Fexample.com%2Fa.png" -D - -o a.png
-
-origin-image-cache get "https://example.com/a.png" --index ./index -o a.png
+origin-image-cache serve --index ./index        # 127.0.0.1:8765 by default
 ```
 
-`serve` listens on `127.0.0.1:8765` by default. `GET /v1/image?url=<origin-url>` returns the image bytes. The response header `X-Cache` is `MISS` the first time and `HIT` after the bytes are stored. `GET /health` returns `{"status":"ok"}`.
+```bash
+curl -fsS -G --data-urlencode "url=https://example.com/a.png" \
+  http://127.0.0.1:8765/v1/image -D - -o a.png
+```
 
-The server fetches whatever http or https URL the client sends. That is safe on localhost. If you bind another address, anyone who can reach the port can make this process fetch URLs.
+- `GET /v1/image?url=<origin-url>` returns the bytes. `X-Cache: MISS` on the first fetch, `HIT` after.
+- `GET /health` returns `{"status":"ok"}`.
+- Errors are JSON `{"error": ...}`: 400 missing or non-http(s) `url`, 404 origin not found, 413 too large, 415 not an image, 502 origin failure.
 
-`get` writes the same bytes to `-o` or to stdout. A miss fetches the origin URL directly (environment proxies are ignored) and stores the body in the index. The response must be a PNG, JPEG, GIF, WebP, or SVG.
+The server fetches whatever http(s) URL a client sends. That is fine on localhost; if you bind another address with `--host`, anyone who can reach the port can make this process fetch URLs.
+
+## One-off fetch
+
+```bash
+origin-image-cache get "https://example.com/a.png" --index ./index -o a.png   # stdout without -o
+```
+
+Prints `HIT` or `MISS` with the content type and size to stderr, and exits 1 on error.
 
 ## Library
 
 ```python
 from origin_image_cache import ImageCache
 
-image = ImageCache("./index").get("https://example.com/a.png")
+image = ImageCache("./index", timeout=20.0, max_bytes=25 * 1024 * 1024).get("https://example.com/a.png")
 image.body          # bytes
-image.content_type  # for example "image/png"
-image.hit           # False on the fetch, True after it is stored
+image.content_type  # e.g. "image/png"
+image.hit           # False on the first fetch, True afterwards
+```
+
+Failures raise subclasses of `origin_image_cache.cache.CacheError`.
+
+## Notes
+
+- Origin fetches ignore `HTTP(S)_PROXY` environment variables.
+- Nothing expires. The index is `manifest.json` plus `objects/`; delete it to clear the cache.
+
+## Development
+
+```bash
+pip install -e ".[dev]" && pytest
 ```
