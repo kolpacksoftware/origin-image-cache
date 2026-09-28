@@ -1,14 +1,29 @@
 [build-system]
-requires = ["setuptools>=61", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "origin-image-cache"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Serve image bytes for an origin URL from local indexes, or fetch and store a miss."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "James Kolpack", email = "james.kolpack@gmail.com" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP",
+]
 dependencies = []
 
 [project.optional-dependencies]
@@ -22,6 +37,9 @@ Repository = "https://github.com/kolpacksoftware/origin-image-cache"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "origin_image_cache.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

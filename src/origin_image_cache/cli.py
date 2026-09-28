@@ -33,7 +33,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="store_true", help="print the package version and exit")
     subparsers = parser.add_subparsers(dest="command")
 
-    serve = subparsers.add_parser("serve", help="serve cached image bytes over HTTP")
+    serve = subparsers.add_parser(
+        "serve",
+        help="serve cached image bytes over HTTP",
+        description=(
+            "Serve cached image bytes over HTTP. "
+            "Binds to 127.0.0.1 by default and fetches whatever http(s) URL a client sends."
+        ),
+    )
     serve.add_argument("--index", type=Path, required=True, help="directory for the local image index")
     serve.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=8765, help="bind port (default: 8765)")

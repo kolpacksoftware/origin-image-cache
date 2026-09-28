@@ -42,6 +42,8 @@ origin-image-cache get "https://example.com/a.png" --index ./index -o a.png
 
 `serve` listens on `127.0.0.1:8765` by default. `GET /v1/image?url=<origin-url>` returns the image bytes. The response header `X-Cache` is `MISS` the first time and `HIT` after the bytes are stored. `GET /health` returns `{"status":"ok"}`.
 
+The server fetches whatever http or https URL the client sends. That is safe on localhost. If you bind another address, anyone who can reach the port can make this process fetch URLs.
+
 `get` writes the same bytes to `-o` or to stdout. A miss fetches the origin URL directly (environment proxies are ignored) and stores the body in the index. The response must be a PNG, JPEG, GIF, WebP, or SVG.
 
 ## Library
