@@ -6,7 +6,7 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlsplit
 
-from origin_image_cache.cache import CacheError, ImageCache
+from origin_image_cache.cache import CacheError, ImageCache, cache_status
 
 
 class ImageCacheServer(ThreadingHTTPServer):
@@ -48,7 +48,7 @@ def make_server(
                 200,
                 image.body,
                 image.content_type,
-                extra=[("X-Cache", "HIT" if image.hit else "MISS")],
+                extra=[("X-Cache", cache_status(image.where))],
             )
 
         def log_message(self, fmt: str, *args: object) -> None:

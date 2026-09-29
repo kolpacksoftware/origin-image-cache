@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import threading
 import urllib.error
 import urllib.parse
@@ -8,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from origin_image_cache import ImageCache
+from origin_image_cache.cache import ReadOnlyIndex
 from origin_image_cache.cli import main
 from origin_image_cache.server import make_server
 from tests.support import make_png, serve_origin
@@ -44,6 +46,7 @@ def test_http_miss_then_hit(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+        cache.close()
 
     assert health_status == 200
     assert json.loads(health_body) == {"status": "ok"}
@@ -89,7 +92,140 @@ def test_http_rejects_non_image(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+        cache.close()
 
     assert status == 415
     assert headers["content-type"].startswith("application/json")
     assert "not a png" in json.loads(body)["error"]
+
+
+def test_http_read_only_index_header(tmp_path: Path) -> None:
+    cached = make_png(rgb=(0, 255, 0))
+    origin = make_png(rgb=(255, 0, 0))
+    root = tmp_path / "files"
+    root.mkdir()
+    (root / "pic.png").write_bytes(cached)
+    db = tmp_path / "images.sqlite"
+    with serve_origin(origin, "image/png") as (origin_url, state):
+        connection = sqlite3.connect(db)
+        connection.execute("CREATE TABLE images (url TEXT, path TEXT)")
+        connection.execute("INSERT INTO images (url, path) VALUES (?, ?)", (origin_url, "pic.png"))
+        connection.commit()
+        connection.close()
+        cache = ImageCache(
+            tmp_path / "index",
+            read_only=[
+                ReadOnlyIndex(db=db, table="images", root=root, url_column="url", path_column="path")
+            ],
+        )
+        server = make_server(cache, "127.0.0.1", 0, quiet=True)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            request_url = "http://127.0.0.1:%s/v1/image?%s" % (
+                port,
+                urllib.parse.urlencode({"url": origin_url}),
+            )
+            status, headers, body = _http_get(request_url)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            cache.close()
+
+    assert state["hits"] == 0
+    assert status == 200
+    assert headers["x-cache"] == "INDEX"
+    assert headers["content-type"] == "image/png"
+    assert body == cached
+
+
+def test_cli_read_only_prints_index(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    png = make_png()
+    root = tmp_path / "files"
+    root.mkdir()
+    (root / "pic.png").write_bytes(png)
+    db = tmp_path / "images.sqlite"
+    connection = sqlite3.connect(db)
+    connection.execute("CREATE TABLE images (url TEXT, path TEXT)")
+    connection.execute(
+        "INSERT INTO images (url, path) VALUES (?, ?)",
+        ("https://example.com/a.png", "pic.png"),
+    )
+    connection.commit()
+    connection.close()
+    config = tmp_path / "indexes.json"
+    config.write_text(
+        json.dumps(
+            {
+                "db": db.name,
+                "table": "images",
+                "root": root.name,
+                "urlColumn": "url",
+                "pathColumn": "path",
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "out.png"
+    code = main(
+        [
+            "get",
+            "https://example.com/a.png",
+            "--index",
+            str(tmp_path / "index"),
+            "--read-only",
+            str(config),
+            "-o",
+            str(output),
+        ]
+    )
+
+    assert code == 0
+    assert "INDEX image/png" in capsys.readouterr().err
+    assert output.read_bytes() == png
+
+
+def test_cli_max_bytes_rejects_large_origin(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    png = make_png()
+    assert len(png) > 10
+    output = tmp_path / "out.png"
+    with serve_origin(png, "image/png") as (origin_url, state):
+        code = main(
+            [
+                "get",
+                origin_url,
+                "--index",
+                str(tmp_path / "index"),
+                "--max-bytes",
+                "10",
+                "-o",
+                str(output),
+            ]
+        )
+
+    assert code == 1
+    assert "exceeds" in capsys.readouterr().err
+    assert state["hits"] == 1
+    assert not output.exists()
+
+
+def test_cli_bad_read_only_config(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = tmp_path / "indexes.json"
+    config.write_text("{", encoding="utf-8")
+    code = main(
+        [
+            "get",
+            "https://example.com/a.png",
+            "--index",
+            str(tmp_path / "index"),
+            "--read-only",
+            str(config),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "error:" in captured.err
+    assert "not valid JSON" in captured.err
