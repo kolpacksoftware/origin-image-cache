@@ -34,13 +34,14 @@ def serve_origin(
     *,
     path: str = "/pic.png",
     status: int = 200,
-) -> Iterator[tuple[str, dict[str, int]]]:
+) -> Iterator[tuple[str, dict]]:
     """Serve one response and count GETs. Yields the origin URL and a hit counter."""
-    state = {"hits": 0}
+    state: dict = {"hits": 0, "user_agents": []}
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             state["hits"] += 1
+            state["user_agents"].append(self.headers.get("User-Agent", ""))
             if self.path != path:
                 payload = b"missing"
                 self.send_response(404)

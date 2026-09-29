@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
 import threading
 import urllib.error
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from http.client import HTTPResponse
 from pathlib import Path
@@ -119,11 +120,15 @@ class ImageCache:
         timeout: float = 20.0,
         max_bytes: int = 25 * 1024 * 1024,
         read_only: Sequence[ReadOnlyIndex] | None = None,
+        user_agent: str | None = None,
+        host_agents: Mapping[str, str] | None = None,
     ) -> None:
         self.index_dir = Path(index_dir)
         self.objects_dir = self.index_dir / "objects"
         self.timeout = timeout
         self.max_bytes = max_bytes
+        self._user_agent = _user_agent() if user_agent is None else _require_agent(user_agent, "userAgent")
+        self._host_agents = _require_host_agents(host_agents)
         self._lock = threading.Lock()
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self._db: sqlite3.Connection | None = None
@@ -258,7 +263,7 @@ class ImageCache:
         return body
 
     def _fetch(self, url: str) -> tuple[bytes, str]:
-        request = urllib.request.Request(url, headers={"User-Agent": _user_agent()})
+        request = urllib.request.Request(url, headers={"User-Agent": self._agent_for(url)})
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
                 return self._read_image(url, response)
@@ -323,6 +328,14 @@ class ImageCache:
             connection.close()
             raise CacheError(f"read-only index {db_path} failed: {exc}") from exc
         return _OpenReadOnly(root=Path(spec.root), sql=sql, status=spec.status, connection=connection)
+
+    def _agent_for(self, url: str) -> str:
+        host = urlsplit(url).hostname
+        if host is not None:
+            override = self._host_agents.get(host)
+            if override is not None:
+                return override
+        return self._user_agent
 
     def _require_db(self) -> sqlite3.Connection:
         if self._db is None:
@@ -429,3 +442,68 @@ def _user_agent() -> str:
     from origin_image_cache import __version__
 
     return f"origin-image-cache/{__version__}"
+
+
+def load_fetch_config(path: str | Path) -> tuple[str, dict[str, str]]:
+    """Load a default User-Agent and hostname overrides from JSON."""
+    config_path = Path(path)
+    try:
+        payload = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CacheError(f"cannot read {config_path}: {exc.strerror or exc}") from exc
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise CacheError(f"fetch config is not valid JSON: {config_path}") from exc
+    if not isinstance(data, dict):
+        raise CacheError(f"fetch config must be a JSON object: {config_path}")
+    allowed = {"userAgent", "hosts"}
+    unknown = sorted(set(data) - allowed)
+    missing = sorted(key for key in allowed if key not in data)
+    if unknown:
+        raise CacheError(f"fetch config has unknown keys: {', '.join(unknown)}")
+    if missing:
+        raise CacheError(f"fetch config is missing keys: {', '.join(missing)}")
+    return _require_agent(data["userAgent"], "userAgent"), _require_host_agents(data["hosts"])
+
+
+def _require_agent(value: object, label: str) -> str:
+    if not isinstance(value, str) or value == "":
+        raise CacheError(f"fetch config {label} must be a non-empty string")
+    if any(char in value for char in "\r\n"):
+        raise CacheError(f"fetch config {label} must not contain CR or LF")
+    return value
+
+
+def _require_host_agents(value: Mapping[str, str] | None) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise CacheError("fetch config hosts must be a JSON object")
+    agents: dict[str, str] = {}
+    for key, agent in value.items():
+        host = _require_hostname(key)
+        if host in agents:
+            raise CacheError(f"fetch config host is listed twice: {host}")
+        agents[host] = _require_agent(agent, "host userAgent")
+    return agents
+
+
+def _require_hostname(value: object) -> str:
+    if not isinstance(value, str) or value == "" or value != value.strip():
+        raise CacheError("fetch config host must be a hostname")
+    if any(char in value for char in "\r\n\t /?#@"):
+        raise CacheError(f"fetch config host is not a hostname: {value!r}")
+    parts = urlsplit(f"//{value}")
+    host = parts.hostname
+    if (
+        host is None
+        or parts.port is not None
+        or parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+        or parts.path not in {"", "/"}
+    ):
+        raise CacheError(f"fetch config host is not a hostname: {value!r}")
+    return host

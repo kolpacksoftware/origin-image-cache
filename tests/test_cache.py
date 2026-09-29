@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from origin_image_cache import ImageCache
+from origin_image_cache import __version__
 from origin_image_cache.cache import (
     CacheError,
     InvalidUrlError,
@@ -12,6 +13,7 @@ from origin_image_cache.cache import (
     OriginNotFoundError,
     ReadOnlyIndex,
     TooLargeError,
+    load_fetch_config,
 )
 from tests.support import make_png, serve_origin
 
@@ -309,6 +311,79 @@ def test_rejects_non_http_url(tmp_path: Path) -> None:
     with ImageCache(tmp_path / "index") as cache:
         with pytest.raises(InvalidUrlError):
             cache.get("file:///tmp/pic.png")
+
+
+def test_default_user_agent_is_package_version(tmp_path: Path) -> None:
+    png = make_png()
+    with ImageCache(tmp_path / "index") as cache, serve_origin(png, "image/png") as (url, state):
+        cache.get(url)
+
+    assert state["user_agents"] == [f"origin-image-cache/{__version__}"]
+
+
+def test_configured_user_agent_used_for_unlisted_host(tmp_path: Path) -> None:
+    png = make_png()
+    with ImageCache(tmp_path / "index", user_agent="curl/8.0", host_agents={"example.test": "ExampleBrowser/1.0"}) as cache:
+        with serve_origin(png, "image/png") as (url, state):
+            cache.get(url)
+
+    assert state["user_agents"] == ["curl/8.0"]
+
+
+def test_host_user_agent_override(tmp_path: Path) -> None:
+    png = make_png()
+    with ImageCache(tmp_path / "index", user_agent="curl/8.0", host_agents={"127.0.0.1": "ExampleBrowser/1.0"}) as cache:
+        with serve_origin(png, "image/png") as (url, state):
+            cache.get(url)
+
+    assert state["user_agents"] == ["ExampleBrowser/1.0"]
+
+
+def test_load_fetch_config(tmp_path: Path) -> None:
+    path = tmp_path / "fetch.json"
+    path.write_text(
+        '{"userAgent": "curl/8.0", "hosts": {"Example.TEST": "ExampleBrowser/1.0"}}',
+        encoding="utf-8",
+    )
+    user_agent, hosts = load_fetch_config(path)
+    assert user_agent == "curl/8.0"
+    assert hosts == {"example.test": "ExampleBrowser/1.0"}
+
+
+def test_load_fetch_config_rejects_bad_files(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.json"
+    with pytest.raises(CacheError, match="cannot read"):
+        load_fetch_config(missing)
+
+    invalid = tmp_path / "invalid.json"
+    invalid.write_text("{", encoding="utf-8")
+    with pytest.raises(CacheError, match="not valid JSON"):
+        load_fetch_config(invalid)
+
+    unknown = tmp_path / "unknown.json"
+    unknown.write_text('{"userAgent": "curl/8.0", "hosts": {}, "extra": 1}', encoding="utf-8")
+    with pytest.raises(CacheError, match="unknown keys"):
+        load_fetch_config(unknown)
+
+    empty_agent = tmp_path / "empty.json"
+    empty_agent.write_text('{"userAgent": "", "hosts": {}}', encoding="utf-8")
+    with pytest.raises(CacheError, match="userAgent"):
+        load_fetch_config(empty_agent)
+
+    newline = tmp_path / "newline.json"
+    newline.write_text('{"userAgent": "curl/8.0\\n", "hosts": {}}', encoding="utf-8")
+    with pytest.raises(CacheError, match="CR or LF"):
+        load_fetch_config(newline)
+
+    bad_host = tmp_path / "host.json"
+    bad_host.write_text('{"userAgent": "curl/8.0", "hosts": {"example.test:443": "x"}}', encoding="utf-8")
+    with pytest.raises(CacheError, match="not a hostname"):
+        load_fetch_config(bad_host)
+
+    twice = tmp_path / "twice.json"
+    twice.write_text('{"userAgent": "curl/8.0", "hosts": {"a.test": "x", "A.test": "y"}}', encoding="utf-8")
+    with pytest.raises(CacheError, match="listed twice"):
+        load_fetch_config(twice)
 
 
 def _spec(db: Path, root: Path, **kwargs: str) -> ReadOnlyIndex:

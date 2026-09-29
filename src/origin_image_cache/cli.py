@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from origin_image_cache import __version__
-from origin_image_cache.cache import CacheError, ImageCache, ReadOnlyIndex, cache_status
+from origin_image_cache.cache import CacheError, ImageCache, ReadOnlyIndex, cache_status, load_fetch_config
 from origin_image_cache.server import make_server
 
 _DEFAULT_MAX_BYTES = 25 * 1024 * 1024
@@ -23,9 +23,9 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
     if args.command == "serve":
-        return _serve(args.index, args.host, args.port, args.read_only, args.max_bytes)
+        return _serve(args.index, args.host, args.port, args.read_only, args.max_bytes, args.fetch)
     if args.command == "get":
-        return _get(args.url, args.index, args.output, args.read_only, args.max_bytes)
+        return _get(args.url, args.index, args.output, args.read_only, args.max_bytes, args.fetch)
     parser.print_help()
     return 0
 
@@ -60,6 +60,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _add_cache_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--index", type=Path, required=True, help="directory for the local image index")
     parser.add_argument("--read-only", type=Path, help="JSON file listing read-only sqlite indexes")
+    parser.add_argument("--fetch", type=Path, help="JSON file with userAgent and per-host overrides")
     parser.add_argument(
         "--max-bytes",
         type=_positive_int,
@@ -78,9 +79,16 @@ def _positive_int(value: str) -> int:
     return number
 
 
-def _serve(index: Path, host: str, port: int, read_only: Path | None, max_bytes: int) -> int:
+def _serve(
+    index: Path,
+    host: str,
+    port: int,
+    read_only: Path | None,
+    max_bytes: int,
+    fetch: Path | None,
+) -> int:
     try:
-        cache = _open_cache(index, read_only, max_bytes)
+        cache = _open_cache(index, read_only, max_bytes, fetch)
     except CacheError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -97,9 +105,16 @@ def _serve(index: Path, host: str, port: int, read_only: Path | None, max_bytes:
     return 0
 
 
-def _get(url: str, index: Path, output: Path | None, read_only: Path | None, max_bytes: int) -> int:
+def _get(
+    url: str,
+    index: Path,
+    output: Path | None,
+    read_only: Path | None,
+    max_bytes: int,
+    fetch: Path | None,
+) -> int:
     try:
-        with _open_cache(index, read_only, max_bytes) as cache:
+        with _open_cache(index, read_only, max_bytes, fetch) as cache:
             image = cache.get(url)
     except CacheError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -112,8 +127,18 @@ def _get(url: str, index: Path, output: Path | None, read_only: Path | None, max
     return 0
 
 
-def _open_cache(index: Path, read_only: Path | None, max_bytes: int) -> ImageCache:
-    return ImageCache(index, max_bytes=max_bytes, read_only=_load_read_only(read_only))
+def _open_cache(index: Path, read_only: Path | None, max_bytes: int, fetch: Path | None) -> ImageCache:
+    user_agent = None
+    host_agents = None
+    if fetch is not None:
+        user_agent, host_agents = load_fetch_config(fetch)
+    return ImageCache(
+        index,
+        max_bytes=max_bytes,
+        read_only=_load_read_only(read_only),
+        user_agent=user_agent,
+        host_agents=host_agents,
+    )
 
 
 def _load_read_only(path: Path | None) -> list[ReadOnlyIndex]:

@@ -7,12 +7,13 @@ All notable changes to this project are documented here. This project uses
 
 ### Changed
 
-- The writable index is `index.sqlite` plus `objects/`. `manifest.json` is not read or written, and 0.1 indexes are not migrated.
+- The writable index is `index.sqlite` plus `objects/`, replacing `manifest.json`.
 
 ### Added
 
 - Optional read-only sqlite indexes (`--read-only`, `ImageCache(read_only=...)`). A hit from one has `where` of `read-only` and `X-Cache: INDEX`. The `http` and `https` form of a URL are both tried. Files must stay inside the configured root.
 - `--max-bytes` on `serve` and `get` (default 25 MB).
+- `--fetch` JSON with `userAgent` and per-host overrides (`ImageCache(user_agent=..., host_agents=...)`). No hostnames in the package. Without `--fetch` the agent stays `origin-image-cache/<version>`.
 
 ## 0.1.0
 

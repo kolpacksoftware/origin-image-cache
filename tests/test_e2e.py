@@ -211,6 +211,51 @@ def test_cli_max_bytes_rejects_large_origin(tmp_path: Path, capsys: pytest.Captu
     assert not output.exists()
 
 
+def test_cli_fetch_sends_configured_agent(tmp_path: Path) -> None:
+    png = make_png()
+    config = tmp_path / "fetch.json"
+    config.write_text(
+        '{"userAgent": "curl/8.0", "hosts": {"example.test": "ExampleBrowser/1.0"}}',
+        encoding="utf-8",
+    )
+    with serve_origin(png, "image/png") as (origin_url, state):
+        code = main(
+            [
+                "get",
+                origin_url,
+                "--index",
+                str(tmp_path / "index"),
+                "--fetch",
+                str(config),
+                "-o",
+                str(tmp_path / "out.png"),
+            ]
+        )
+
+    assert code == 0
+    assert state["user_agents"] == ["curl/8.0"]
+
+
+def test_cli_bad_fetch_config(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config = tmp_path / "fetch.json"
+    config.write_text("{", encoding="utf-8")
+    code = main(
+        [
+            "get",
+            "https://example.com/a.png",
+            "--index",
+            str(tmp_path / "index"),
+            "--fetch",
+            str(config),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "error:" in captured.err
+    assert "not valid JSON" in captured.err
+
+
 def test_cli_bad_read_only_config(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     config = tmp_path / "indexes.json"
     config.write_text("{", encoding="utf-8")
