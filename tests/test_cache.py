@@ -1,5 +1,7 @@
 import hashlib
 import sqlite3
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ from origin_image_cache.cache import (
     CacheError,
     InvalidUrlError,
     NotAnImageError,
+    OriginError,
     OriginNotFoundError,
     ReadOnlyIndex,
     TooLargeError,
@@ -299,6 +302,74 @@ def test_html_response_is_not_stored(tmp_path: Path) -> None:
     assert (index / "index.sqlite").is_file()
     assert not (index / "manifest.json").exists()
     assert _object_count(index) == 0
+
+
+def test_slow_miss_does_not_block_cached_hit(tmp_path: Path) -> None:
+    cached_png = make_png(rgb=(0, 255, 0))
+    slow_png = make_png(rgb=(255, 0, 0))
+    with ImageCache(tmp_path / "index") as cache:
+        with serve_origin(cached_png, "image/png") as (cached_url, _cached_state):
+            cache.get(cached_url)
+        with serve_origin(slow_png, "image/png", delay_s=0.8) as (slow_url, _slow_state):
+            started = threading.Event()
+            errors: list[BaseException] = []
+
+            def miss() -> None:
+                started.set()
+                try:
+                    cache.get(slow_url)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            worker = threading.Thread(target=miss)
+            worker.start()
+            assert started.wait(timeout=1)
+            t0 = time.monotonic()
+            hit = cache.get(cached_url)
+            elapsed = time.monotonic() - t0
+            worker.join(timeout=2)
+
+    assert errors == []
+    assert elapsed < 0.4
+    assert hit.body == cached_png
+    assert hit.where == "index"
+
+
+def test_trickle_past_timeout_is_not_stored(tmp_path: Path) -> None:
+    png = make_png()
+    index = tmp_path / "index"
+    with ImageCache(index, timeout=0.3) as cache:
+        with serve_origin(png, "image/png", chunk_size=1, chunk_pause_s=0.05) as (url, _state):
+            with pytest.raises(OriginError, match="timed out"):
+                cache.get(url)
+
+    assert _object_count(index) == 0
+
+
+def test_concurrent_misses_fetch_once(tmp_path: Path) -> None:
+    png = make_png()
+    results: list[object] = []
+    errors: list[BaseException] = []
+    with ImageCache(tmp_path / "index") as cache, serve_origin(
+        png, "image/png", delay_s=0.2
+    ) as (url, state):
+
+        def worker() -> None:
+            try:
+                results.append(cache.get(url))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+    assert errors == []
+    assert state["hits"] == 1
+    assert len(results) == 2
+    assert all(getattr(image, "body") == png for image in results)
 
 
 def test_origin_404(tmp_path: Path) -> None:

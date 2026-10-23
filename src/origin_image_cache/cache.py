@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
@@ -15,6 +16,8 @@ from dataclasses import dataclass
 from http.client import HTTPResponse
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
+
+_READ_CHUNK = 65536
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _STATUS = {"index": "HIT", "read-only": "INDEX", "miss": "MISS"}
@@ -97,6 +100,15 @@ class _OpenReadOnly:
     connection: sqlite3.Connection
 
 
+class _Flight:
+    """One in-flight miss. Waiters block on ``done``, not the index lock."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.image: CachedImage | None = None
+        self.error: BaseException | None = None
+
+
 def cache_status(where: str) -> str:
     """Return the HIT, INDEX, or MISS token for a ``CachedImage.where`` value."""
     try:
@@ -130,13 +142,15 @@ class ImageCache:
         self._user_agent = _user_agent() if user_agent is None else _require_agent(user_agent, "userAgent")
         self._host_agents = _require_host_agents(host_agents)
         self._lock = threading.Lock()
+        self._inflight: dict[str, _Flight] = {}
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self._db: sqlite3.Connection | None = None
         self._read_only: list[_OpenReadOnly] = []
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.objects_dir.mkdir(parents=True, exist_ok=True)
         try:
-            # serve calls get on worker threads. The lock in get serializes this connection.
+            # serve calls get on worker threads. The lock serializes sqlite on this
+            # connection. Origin fetches and object-file reads run outside it.
             self._db = sqlite3.connect(self.index_dir / "index.sqlite", check_same_thread=False)
             with self._db:
                 self._db.execute(
@@ -175,24 +189,110 @@ class ImageCache:
     def get(self, url: str) -> CachedImage:
         """Return image bytes for `url`, fetching and storing them on a miss."""
         normalized = normalize_url(url)
-        with self._lock:
-            cached = self._lookup(normalized)
-            if cached is not None:
-                return cached
-            external = self._lookup_read_only(normalized)
-            if external is not None:
-                return external
-            body, content_type = self._fetch(normalized)
-            self._store(normalized, body, content_type)
-            return CachedImage(
-                url=normalized,
-                body=body,
-                content_type=content_type,
-                hit=False,
-                where="miss",
+        own, readonly, flight, lead = self._plan_get(normalized, prefer_own=True)
+        if own is not None:
+            image = self._read_own_object(own[0], own[1], normalized)
+            if image is not None:
+                return image
+            own, readonly, flight, lead = self._plan_get(normalized, prefer_own=False)
+        for root, stored in readonly:
+            image = self._image_from_read_only_file(root, stored, normalized)
+            if image is not None:
+                return image
+        if flight is None:
+            own, _, flight, lead = self._plan_get(
+                normalized, prefer_own=True, force_fetch=True
             )
+            if own is not None:
+                image = self._read_own_object(own[0], own[1], normalized)
+                if image is not None:
+                    return image
+                _, _, flight, lead = self._plan_get(
+                    normalized, prefer_own=False, force_fetch=True
+                )
+        if not lead:
+            assert flight is not None
+            return self._join_flight(flight)
+        return self._complete_flight(normalized, flight)
 
-    def _lookup(self, url: str) -> CachedImage | None:
+    def _plan_get(
+        self, url: str, *, prefer_own: bool, force_fetch: bool = False
+    ) -> tuple[tuple[str, str] | None, list[tuple[Path, object]], _Flight | None, bool]:
+        with self._lock:
+            own = self._index_row(url) if prefer_own else None
+            readonly: list[tuple[Path, object]] = []
+            if own is None and not force_fetch:
+                readonly = self._read_only_rows(url)
+            flight: _Flight | None = None
+            lead = False
+            if own is None and not readonly:
+                flight, lead = self._claim_flight_unlocked(url)
+            return own, readonly, flight, lead
+
+    def _claim_flight_unlocked(self, url: str) -> tuple[_Flight, bool]:
+        existing = self._inflight.get(url)
+        if existing is not None:
+            return existing, False
+        flight = _Flight()
+        self._inflight[url] = flight
+        return flight, True
+
+    def _join_flight(self, flight: _Flight) -> CachedImage:
+        if not flight.done.wait(timeout=self.timeout + 1):
+            raise OriginError("timed out waiting for an in-flight fetch")
+        if flight.error is not None:
+            raise flight.error
+        assert flight.image is not None
+        return flight.image
+
+    def _complete_flight(self, url: str, flight: _Flight) -> CachedImage:
+        try:
+            body, content_type = self._fetch(url)
+            relative = self._write_object_file(url, body)
+        except BaseException as exc:
+            self._finish_flight(url, flight, error=exc)
+            raise
+        image = CachedImage(
+            url=url,
+            body=body,
+            content_type=content_type,
+            hit=False,
+            where="miss",
+        )
+        try:
+            with self._lock:
+                self._insert_index_unlocked(url, relative, content_type)
+                self._finish_flight_unlocked(url, flight, image=image)
+        except BaseException as exc:
+            self._finish_flight(url, flight, error=exc)
+            raise
+        return image
+
+    def _finish_flight(
+        self,
+        url: str,
+        flight: _Flight,
+        *,
+        image: CachedImage | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        with self._lock:
+            self._finish_flight_unlocked(url, flight, image=image, error=error)
+
+    def _finish_flight_unlocked(
+        self,
+        url: str,
+        flight: _Flight,
+        *,
+        image: CachedImage | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        flight.image = image
+        flight.error = error
+        self._inflight.pop(url, None)
+        flight.done.set()
+
+    def _index_row(self, url: str) -> tuple[str, str] | None:
         try:
             row = self._require_db().execute(
                 "SELECT path, content_type FROM objects WHERE url = ?",
@@ -202,7 +302,9 @@ class ImageCache:
             raise CacheError(f"index lookup failed: {exc}") from exc
         if row is None:
             return None
-        relative, content_type = row
+        return str(row[0]), str(row[1])
+
+    def _read_own_object(self, relative: str, content_type: str, url: str) -> CachedImage | None:
         path = self._object_path(relative)
         if not path.is_file():
             return None
@@ -214,26 +316,23 @@ class ImageCache:
             where="index",
         )
 
-    def _lookup_read_only(self, url: str) -> CachedImage | None:
+    def _read_only_rows(self, url: str) -> list[tuple[Path, object]]:
         twin = _scheme_twin(url)
+        found: list[tuple[Path, object]] = []
         for opened in self._read_only:
             for candidate in (url, twin):
-                found = self._match_read_only(opened, candidate, url)
-                if found is not None:
-                    return found
-        return None
+                found.extend(self._query_read_only(opened, candidate))
+        return found
 
-    def _match_read_only(self, opened: _OpenReadOnly, candidate: str, requested: str) -> CachedImage | None:
+    def _query_read_only(
+        self, opened: _OpenReadOnly, candidate: str
+    ) -> list[tuple[Path, object]]:
         params: tuple[str, ...] = (candidate,) if opened.status is None else (candidate, opened.status)
         try:
             rows = opened.connection.execute(opened.sql, params).fetchall()
         except sqlite3.Error as exc:
             raise CacheError(f"read-only index query failed: {exc}") from exc
-        for (stored,) in rows:
-            image = self._image_from_read_only_file(opened.root, stored, requested)
-            if image is not None:
-                return image
-        return None
+        return [(opened.root, stored) for (stored,) in rows]
 
     def _image_from_read_only_file(self, root: Path, stored: object, url: str) -> CachedImage | None:
         path = _readable_in_root(root, stored)
@@ -285,7 +384,11 @@ class ImageCache:
                     raise TooLargeError(f"image at {url} exceeds {self.max_bytes} bytes")
             except ValueError:
                 pass
-        body = response.read(self.max_bytes + 1)
+        body = _read_until(
+            response,
+            limit=self.max_bytes + 1,
+            deadline=time.monotonic() + self.timeout,
+        )
         if len(body) > self.max_bytes:
             raise TooLargeError(f"image at {url} exceeds {self.max_bytes} bytes")
         header_type = ""
@@ -294,7 +397,7 @@ class ImageCache:
         content_type = resolve_content_type(header_type, body)
         return body, content_type
 
-    def _store(self, url: str, body: bytes, content_type: str) -> None:
+    def _write_object_file(self, url: str, body: bytes) -> str:
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
         relative = f"{digest[:2]}/{digest}"
         destination = self.objects_dir / relative
@@ -302,6 +405,9 @@ class ImageCache:
         temporary = destination.with_name(destination.name + ".tmp")
         temporary.write_bytes(body)
         os.replace(temporary, destination)
+        return relative
+
+    def _insert_index_unlocked(self, url: str, relative: str, content_type: str) -> None:
         try:
             with self._require_db() as db:
                 db.execute(
@@ -348,6 +454,21 @@ class ImageCache:
         if not path.is_relative_to(root):
             raise CacheError("index entry escapes the object directory")
         return path
+
+
+def _read_until(response: HTTPResponse, *, limit: int, deadline: float) -> bytes:
+    """Read at most *limit* bytes, stopping at EOF or the wall-clock *deadline*."""
+    chunks: list[bytes] = []
+    total = 0
+    while total < limit:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("The read operation timed out")
+        piece = response.read(min(_READ_CHUNK, limit - total))
+        if not piece:
+            break
+        chunks.append(piece)
+        total += len(piece)
+    return b"".join(chunks)
 
 
 def normalize_url(url: str) -> str:

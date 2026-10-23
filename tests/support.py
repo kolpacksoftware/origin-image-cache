@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import struct
 import threading
+import time
 import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -34,6 +35,9 @@ def serve_origin(
     *,
     path: str = "/pic.png",
     status: int = 200,
+    delay_s: float = 0,
+    chunk_size: int = 0,
+    chunk_pause_s: float = 0,
 ) -> Iterator[tuple[str, dict]]:
     """Serve one response and count GETs. Yields the origin URL and a hit counter."""
     state: dict = {"hits": 0, "user_agents": []}
@@ -54,7 +58,16 @@ def serve_origin(
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if delay_s:
+                time.sleep(delay_s)
+            if chunk_size > 0:
+                for offset in range(0, len(body), chunk_size):
+                    self.wfile.write(body[offset : offset + chunk_size])
+                    self.wfile.flush()
+                    if chunk_pause_s:
+                        time.sleep(chunk_pause_s)
+            else:
+                self.wfile.write(body)
 
         def log_message(self, fmt: str, *args: object) -> None:
             return
